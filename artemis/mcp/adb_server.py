@@ -44,6 +44,7 @@ from artemis.clients.screen_client_factory import create_screen_client
 from artemis.context import ArtemisContext, DeviceContext, DevicePlatform
 from artemis.controllers.unified_controller import UnifiedMobileController
 from artemis.platform import platform
+from artemis.mcp import ui_corpus
 from third_party.mobile_use.utils.app_launch_utils import launch_app_with_retries
 
 
@@ -462,9 +463,76 @@ async def take_screenshot(ctx: Context) -> str:
         return f"Error: {e}"
 
 
+def _compact_elements(
+    elements: list[dict[str, Any]],
+    flags_spec: tuple[tuple[str, str], ...],
+) -> list[dict[str, Any]]:
+    """Projects a UI dump down to the fields needed to read and act on a screen.
+
+    Drops elements that carry nothing to read and nothing to act on, replaces the
+    bounds with the tap centre, and reports state attributes only when they differ
+    from their default -- except 'checked', which is always reported for a
+    checkable element because both of its values are meaningful. Typically ~86%
+    smaller than the raw dump, which is otherwise dominated by attributes that
+    never vary.
+    """
+    compact = []
+    for element in elements:
+        text = (element.get("text") or "").strip()
+        desc = (element.get("content-desc") or "").strip()
+        hint = (element.get("hint") or "").strip()
+        # The reported value is the attribute's own, not the fact that it matched:
+        # a rule firing on enabled="false" must emit enabled=False, never True.
+        flags = {
+            name: element.get(name) == "true"
+            for name, trigger in flags_spec
+            if element.get(name) == trigger
+        }
+        # A switch reports its state in 'checked', so both values carry meaning and
+        # neither can be inferred from the key being absent.
+        if element.get("checkable") == "true":
+            flags["checked"] = element.get("checked") == "true"
+        if not (text or desc or hint or flags):
+            continue
+
+        item: dict[str, Any] = {}
+        bounds = element.get("parsed_bounds")
+        if bounds:
+            item["center"] = [
+                (bounds["left"] + bounds["right"]) // 2,
+                (bounds["top"] + bounds["bottom"]) // 2,
+            ]
+        if text:
+            item["text"] = text
+        if desc and desc != text:
+            item["desc"] = desc
+        if hint and hint != text:
+            item["hint"] = hint
+        resource_id = (element.get("resource-id") or "").rsplit("/", 1)[-1]
+        if resource_id:
+            item["id"] = resource_id
+        class_name = (element.get("class") or "").rsplit(".", 1)[-1]
+        if class_name:
+            item["class"] = class_name
+        item.update(flags)
+        compact.append(item)
+    return compact
+
+
 @_tool()
-async def get_ui_hierarchy(ctx: Context) -> str:
-    """Retrieves the current UI elements hierarchy from the device."""
+async def get_ui_hierarchy(ctx: Context, compact: bool = True) -> str:
+    """Retrieves the current UI elements hierarchy from the device.
+
+    'compact' (the default) returns {'screen': ..., 'elements': [...]}, where each
+    element carries only what is needed to act on it: 'center' (tap here), 'text',
+    'desc', 'hint', 'id', 'class' and any state that differs from the default. This
+    is ~86% smaller than the raw dump. 'screen' reports the layout's fingerprint,
+    whether it is one this device has not shown before ('new_screen'), and any
+    attribute the projection drops that this app has never used before
+    ('unexamined_attributes') -- a cue to check the projection against that page.
+
+    Set 'compact' to False for the full uiautomator attributes as a plain list.
+    """
     try:
         controller = _get_controller()
     except Exception as e:
@@ -473,10 +541,32 @@ async def get_ui_hierarchy(ctx: Context) -> str:
 
     try:
         elements = await controller.get_ui_elements()
-        return json.dumps(elements)
+        if not compact:
+            return json.dumps(elements, ensure_ascii=False)
+
+        package = ui_corpus.dominant_package(elements)
+        projected = _compact_elements(elements, ui_corpus.kept_attributes(package))
+        payload = json.dumps(projected, ensure_ascii=False)
+        screen = ui_corpus.observe(
+            elements,
+            package=package,
+            raw_chars=len(json.dumps(elements, ensure_ascii=False)),
+            compact_chars=len(payload),
+        )
+        return json.dumps({"screen": screen, "elements": projected}, ensure_ascii=False)
     except Exception as e:
         logger.exception("Failed to get UI elements in get_ui_hierarchy")
         raise e
+
+
+@_tool()
+async def ui_coverage(ctx: Context, package: str | None = None) -> str:
+    """Reports which app screens this device has shown and how much compacting saved.
+
+    'package' limits the report to one app. Use it to see whether a surface has
+    been visited before reaching for the raw hierarchy.
+    """
+    return json.dumps(ui_corpus.coverage(package), ensure_ascii=False)
 
 
 if __name__ == "__main__":
